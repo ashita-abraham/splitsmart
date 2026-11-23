@@ -15,7 +15,7 @@ export interface Expense {
   amount_cents: number;
   paid_by_member_id: number;
   paid_by_name: string;
-  split_type: 'equal' | 'exact';
+  split_type: 'equal' | 'exact' | 'percentage' | 'settlement';
   created_at: string;
   splits: ExpenseSplit[];
 }

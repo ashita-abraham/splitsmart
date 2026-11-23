@@ -50,6 +50,51 @@ def validate_exact_splits(amount_cents: int, custom_splits: Dict[int, int]) -> L
     return [(mid, share) for mid, share in custom_splits.items() if share > 0]
 
 
+def compute_percentage_splits(
+    amount_cents: int, percentage_bps: Dict[int, int]
+) -> List[Tuple[int, int]]:
+    """
+    Splits amount_cents according to member percentages expressed in basis points
+    (100.00% == 10000 bps) using Hamilton's Largest Remainder Method.
+    Guarantees sum(shares) == amount_cents with zero lost pennies.
+    """
+    if amount_cents <= 0:
+        raise ValueError("Expense amount must be greater than $0.00.")
+    if not percentage_bps:
+        raise ValueError("At least one member must be included in the split.")
+
+    for member_id, bps in percentage_bps.items():
+        if bps < 0:
+            raise ValueError(f"Percentage for member {member_id} cannot be negative.")
+
+    total_bps = sum(percentage_bps.values())
+    if total_bps != 10000:
+        raise ValueError(
+            f"Percentages must sum to 100.00% (currently {total_bps / 100:.2f}%)."
+        )
+
+    # Compute exact integer floor and fractional remainder (numerator over 10000)
+    allocations = []
+    floor_sum = 0
+    for mid in sorted(percentage_bps.keys()):
+        bps = percentage_bps[mid]
+        numerator = amount_cents * bps
+        floor_cents = numerator // 10000
+        remainder = numerator % 10000
+        floor_sum += floor_cents
+        allocations.append([mid, floor_cents, remainder])
+
+    # Distribute leftover pennies to members with largest fractional remainders
+    leftover_pennies = amount_cents - floor_sum
+    allocations.sort(key=lambda item: (-item[2], item[0]))
+    for i in range(leftover_pennies):
+        allocations[i][1] += 1
+
+    # Return sorted by member_id, excluding 0-cent shares
+    allocations.sort(key=lambda item: item[0])
+    return [(mid, share) for mid, share, _ in allocations if share > 0]
+
+
 def simplify_debts(net_balances: Dict[int, int], member_names: Dict[int, str]) -> List[Dict]:
     """
     Greedy Minimum-Cash-Flow settlement algorithm in O(N log N) time.
@@ -58,7 +103,6 @@ def simplify_debts(net_balances: Dict[int, int], member_names: Dict[int, str]) -
     Repeatedly matches the largest debtor with the largest creditor using max-heaps
     until all balances are settled to 0 cents.
     """
-    # Python heapq is a min-heap, so negate amounts to simulate a max-heap
     creditors: List[Tuple[int, int]] = []  # (-credit_cents, member_id)
     debtors: List[Tuple[int, int]] = []    # (-debt_cents, member_id)
 
@@ -66,7 +110,7 @@ def simplify_debts(net_balances: Dict[int, int], member_names: Dict[int, str]) -
         if balance > 0:
             heapq.heappush(creditors, (-balance, member_id))
         elif balance < 0:
-            heapq.heappush(debtors, (balance, member_id))  # balance is already negative
+            heapq.heappush(debtors, (balance, member_id))
 
     settlements: List[Dict] = []
 

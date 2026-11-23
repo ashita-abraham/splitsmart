@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { api } from './api';
-import type { GroupListItem, GroupSummary } from './types';
+import type { GroupListItem, GroupSummary, Settlement } from './types';
 
 function formatMoney(cents: number): string {
   const abs = Math.abs(cents) / 100;
@@ -18,14 +18,17 @@ export default function App() {
   const [newMemberName, setNewMemberName] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [copied, setCopied] = useState(false);
 
   // Expense form state
   const [description, setDescription] = useState('');
   const [amountStr, setAmountStr] = useState('');
   const [paidById, setPaidById] = useState<number | ''>('');
-  const [splitType, setSplitType] = useState<'equal' | 'exact'>('equal');
+  const [splitType, setSplitType] = useState<'equal' | 'exact' | 'percentage'>('equal');
   const [selectedMemberIds, setSelectedMemberIds] = useState<number[]>([]);
   const [exactAmounts, setExactAmounts] = useState<Record<number, string>>({});
+  const [percentAmounts, setPercentAmounts] = useState<Record<number, string>>({});
 
   const refreshGroups = async (selectId?: number) => {
     const list = await api.listGroups();
@@ -47,10 +50,13 @@ export default function App() {
       setPaidById(summary.members[0].id);
     }
     const nextExact: Record<number, string> = {};
+    const nextPct: Record<number, string> = {};
     summary.members.forEach((m) => {
       nextExact[m.id] = '';
+      nextPct[m.id] = '';
     });
     setExactAmounts(nextExact);
+    setPercentAmounts(nextPct);
   };
 
   useEffect(() => {
@@ -59,7 +65,7 @@ export default function App() {
 
   const handleCreateGroup = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newGroupName.trim()) return;
+    if (!newGroupName.trim() || loading) return;
     setError(null);
     setLoading(true);
     try {
@@ -74,6 +80,7 @@ export default function App() {
   };
 
   const handleSeedDemo = async () => {
+    if (loading) return;
     setError(null);
     setLoading(true);
     try {
@@ -99,6 +106,17 @@ export default function App() {
     }
   };
 
+  const handleRemoveMember = async (memberId: number) => {
+    if (!activeGroup) return;
+    setError(null);
+    try {
+      const updated = await api.removeMember(activeGroup.id, memberId);
+      syncGroupState(updated);
+    } catch (err: any) {
+      setError(err.message);
+    }
+  };
+
   const toggleSplitMember = (id: number) => {
     setSelectedMemberIds((prev) =>
       prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
@@ -107,7 +125,7 @@ export default function App() {
 
   const handleAddExpense = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!activeGroup) return;
+    if (!activeGroup || submitting) return;
     setError(null);
 
     const parsedDollars = parseFloat(amountStr);
@@ -122,6 +140,7 @@ export default function App() {
       return;
     }
 
+    setSubmitting(true);
     try {
       let updated: GroupSummary;
       if (splitType === 'equal') {
@@ -132,12 +151,31 @@ export default function App() {
           split_type: 'equal',
           split_member_ids: selectedMemberIds,
         });
+      } else if (splitType === 'percentage') {
+        const bpsMap: Record<number, number> = {};
+        for (const m of activeGroup.members) {
+          const val = parseFloat(percentAmounts[m.id] || '0');
+          if (isNaN(val) || val < 0) {
+            setError(`Invalid percentage for ${m.name}.`);
+            setSubmitting(false);
+            return;
+          }
+          bpsMap[m.id] = Math.round(val * 100);
+        }
+        updated = await api.addExpense(activeGroup.id, {
+          description: description.trim(),
+          amount_cents: amountCents,
+          paid_by_member_id: Number(paidById),
+          split_type: 'percentage',
+          percentage_bps: bpsMap,
+        });
       } else {
         const exactMap: Record<number, number> = {};
         for (const m of activeGroup.members) {
           const val = parseFloat(exactAmounts[m.id] || '0');
           if (isNaN(val) || val < 0) {
             setError(`Invalid split amount for ${m.name}.`);
+            setSubmitting(false);
             return;
           }
           exactMap[m.id] = Math.round(val * 100);
@@ -156,7 +194,39 @@ export default function App() {
       syncGroupState(updated);
     } catch (err: any) {
       setError(err.message);
+    } finally {
+      setSubmitting(false);
     }
+  };
+
+  const handleMarkSettled = async (s: Settlement) => {
+    if (!activeGroup) return;
+    setError(null);
+    try {
+      const updated = await api.recordSettlement(activeGroup.id, {
+        from_member_id: s.from_member_id,
+        to_member_id: s.to_member_id,
+        amount_cents: s.amount_cents,
+      });
+      syncGroupState(updated);
+    } catch (err: any) {
+      setError(err.message);
+    }
+  };
+
+  const handleCopySummary = () => {
+    if (!activeGroup) return;
+    const lines = [
+      `${activeGroup.name} — Total Spend: ${formatMoney(activeGroup.total_spend_cents)}`,
+      activeGroup.settlements.length === 0
+        ? 'Everyone is settled up!'
+        : activeGroup.settlements
+            .map((s) => `• ${s.from_name} pays ${s.to_name}: ${formatMoney(s.amount_cents)}`)
+            .join('\n'),
+    ];
+    navigator.clipboard.writeText(lines.join('\n'));
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
   };
 
   const handleDeleteExpense = async (expenseId: number) => {
@@ -189,6 +259,13 @@ export default function App() {
       }, 0)
     : 0;
   const totalTargetCents = Math.round((parseFloat(amountStr) || 0) * 100);
+
+  const percentAllocatedBps = activeGroup
+    ? activeGroup.members.reduce((sum, m) => {
+        const v = parseFloat(percentAmounts[m.id] || '0');
+        return sum + (isNaN(v) ? 0 : Math.round(v * 100));
+      }, 0)
+    : 0;
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
@@ -327,13 +404,25 @@ export default function App() {
               {/* Settlements Card */}
               <section className="bg-slate-900 border border-slate-800 rounded-2xl p-6">
                 <div className="flex items-center justify-between mb-4">
-                  <h3 className="text-base font-semibold text-white">
-                    Simplest Way to Settle Up
-                  </h3>
-                  <span className="text-xs text-indigo-300 bg-indigo-500/15 border border-indigo-400/30 px-2.5 py-0.5 rounded-full">
-                    {activeGroup.settlements.length}{' '}
-                    {activeGroup.settlements.length === 1 ? 'transfer' : 'transfers'}
-                  </span>
+                  <div className="flex items-center gap-2.5">
+                    <h3 className="text-base font-semibold text-white">
+                      Simplest Way to Settle Up
+                    </h3>
+                    <span className="text-xs text-indigo-300 bg-indigo-500/15 border border-indigo-400/30 px-2.5 py-0.5 rounded-full">
+                      {activeGroup.settlements.length}{' '}
+                      {activeGroup.settlements.length === 1 ? 'transfer' : 'transfers'}
+                    </span>
+                  </div>
+
+                  {activeGroup.members.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={handleCopySummary}
+                      className="text-xs text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2.5 py-1 rounded-lg transition cursor-pointer"
+                    >
+                      {copied ? '✓ Copied' : 'Copy Summary'}
+                    </button>
+                  )}
                 </div>
 
                 {activeGroup.settlements.length === 0 ? (
@@ -345,9 +434,9 @@ export default function App() {
                     {activeGroup.settlements.map((s, i) => (
                       <li
                         key={i}
-                        className="flex items-center justify-between bg-slate-950/80 border border-slate-800 rounded-xl px-4 py-3.5"
+                        className="flex items-center justify-between gap-3 bg-slate-950/80 border border-slate-800 rounded-xl px-4 py-3.5"
                       >
-                        <div className="flex items-center gap-2.5 text-sm">
+                        <div className="flex items-center gap-2 text-sm">
                           <span className="font-semibold text-rose-300">
                             {s.from_name}
                           </span>
@@ -356,9 +445,18 @@ export default function App() {
                             {s.to_name}
                           </span>
                         </div>
-                        <span className="font-mono font-bold text-base text-white bg-slate-800 px-3 py-1 rounded-lg">
-                          {formatMoney(s.amount_cents)}
-                        </span>
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono font-bold text-sm text-white bg-slate-800 px-3 py-1 rounded-lg">
+                            {formatMoney(s.amount_cents)}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => handleMarkSettled(s)}
+                            className="text-xs font-medium bg-emerald-600/20 hover:bg-emerald-600/35 text-emerald-300 border border-emerald-500/40 px-2.5 py-1 rounded-lg transition cursor-pointer"
+                          >
+                            Mark Paid
+                          </button>
+                        </div>
                       </li>
                     ))}
                   </ul>
@@ -447,9 +545,17 @@ export default function App() {
                     {activeGroup.members.map((m) => (
                       <span
                         key={m.id}
-                        className="text-xs bg-slate-800/90 text-slate-200 border border-slate-700 px-3 py-1.5 rounded-full"
+                        className="inline-flex items-center gap-1.5 text-xs bg-slate-800/90 text-slate-200 border border-slate-700 px-3 py-1.5 rounded-full"
                       >
                         {m.name}
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveMember(m.id)}
+                          title={`Remove ${m.name}`}
+                          className="text-slate-400 hover:text-rose-300 font-bold cursor-pointer"
+                        >
+                          ×
+                        </button>
                       </span>
                     ))}
                   </div>
@@ -539,6 +645,17 @@ export default function App() {
                           >
                             Exact $
                           </button>
+                          <button
+                            type="button"
+                            onClick={() => setSplitType('percentage')}
+                            className={`px-2.5 py-1 rounded-md transition cursor-pointer ${
+                              splitType === 'percentage'
+                                ? 'bg-indigo-600 text-white'
+                                : 'text-slate-400 hover:text-white'
+                            }`}
+                          >
+                            %
+                          </button>
                         </div>
                       </div>
 
@@ -563,7 +680,7 @@ export default function App() {
                             );
                           })}
                         </div>
-                      ) : (
+                      ) : splitType === 'exact' ? (
                         <div className="space-y-2 bg-slate-950/70 p-3 rounded-xl border border-slate-800">
                           {activeGroup.members.map((m) => (
                             <div
@@ -602,15 +719,56 @@ export default function App() {
                             </span>
                           </div>
                         </div>
+                      ) : (
+                        <div className="space-y-2 bg-slate-950/70 p-3 rounded-xl border border-slate-800">
+                          {activeGroup.members.map((m) => (
+                            <div
+                              key={m.id}
+                              className="flex items-center justify-between gap-2 text-xs"
+                            >
+                              <span className="text-slate-300">{m.name}</span>
+                              <div className="flex items-center gap-1">
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  min="0"
+                                  max="100"
+                                  placeholder="0"
+                                  value={percentAmounts[m.id] || ''}
+                                  onChange={(e) =>
+                                    setPercentAmounts((prev) => ({
+                                      ...prev,
+                                      [m.id]: e.target.value,
+                                    }))
+                                  }
+                                  className="w-20 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1 text-right text-white"
+                                />
+                                <span className="text-slate-400">%</span>
+                              </div>
+                            </div>
+                          ))}
+                          <div className="pt-2 border-t border-slate-800 flex justify-between text-xs">
+                            <span className="text-slate-400">Total %:</span>
+                            <span
+                              className={
+                                percentAllocatedBps === 10000
+                                  ? 'text-emerald-400 font-semibold'
+                                  : 'text-amber-300 font-semibold'
+                              }
+                            >
+                              {(percentAllocatedBps / 100).toFixed(2)}% / 100.00%
+                            </span>
+                          </div>
+                        </div>
                       )}
                     </div>
 
                     <button
                       type="submit"
-                      disabled={activeGroup.members.length === 0}
+                      disabled={activeGroup.members.length === 0 || submitting}
                       className="w-full bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white font-medium py-2.5 rounded-xl text-sm transition cursor-pointer"
                     >
-                      Add Expense
+                      {submitting ? 'Saving...' : 'Add Expense'}
                     </button>
                   </form>
                 </section>
@@ -631,14 +789,24 @@ export default function App() {
                     {activeGroup.expenses.map((exp) => (
                       <div
                         key={exp.id}
-                        className="bg-slate-950/80 border border-slate-800 rounded-xl p-4 flex items-start justify-between gap-4"
+                        className={`border rounded-xl p-4 flex items-start justify-between gap-4 ${
+                          exp.split_type === 'settlement'
+                            ? 'bg-emerald-950/20 border-emerald-500/30'
+                            : 'bg-slate-950/80 border-slate-800'
+                        }`}
                       >
                         <div>
                           <div className="flex items-center gap-2">
                             <h4 className="font-semibold text-white text-sm">
                               {exp.description}
                             </h4>
-                            <span className="text-[11px] uppercase tracking-wider px-2 py-0.5 rounded bg-slate-800 text-slate-400">
+                            <span
+                              className={`text-[11px] uppercase tracking-wider px-2 py-0.5 rounded ${
+                                exp.split_type === 'settlement'
+                                  ? 'bg-emerald-500/20 text-emerald-300'
+                                  : 'bg-slate-800 text-slate-400'
+                              }`}
+                            >
                               {exp.split_type}
                             </span>
                           </div>

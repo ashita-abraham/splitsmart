@@ -43,18 +43,38 @@ export const api = {
       body: JSON.stringify({ name }),
     }).then((r) => handleResponse<GroupSummary>(r)),
 
+  removeMember: (groupId: number, memberId: number) =>
+    fetch(`${API_BASE}/groups/${groupId}/members/${memberId}`, {
+      method: 'DELETE',
+    }).then((r) => handleResponse<GroupSummary>(r)),
+
   addExpense: (
     groupId: number,
     payload: {
       description: string;
       amount_cents: number;
       paid_by_member_id: number;
-      split_type: 'equal' | 'exact';
+      split_type: 'equal' | 'exact' | 'percentage';
       split_member_ids?: number[];
       exact_splits?: Record<number, number>;
+      percentage_bps?: Record<number, number>;
     }
   ) =>
     fetch(`${API_BASE}/groups/${groupId}/expenses`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }).then((r) => handleResponse<GroupSummary>(r)),
+
+  recordSettlement: (
+    groupId: number,
+    payload: {
+      from_member_id: number;
+      to_member_id: number;
+      amount_cents: number;
+    }
+  ) =>
+    fetch(`${API_BASE}/groups/${groupId}/settle`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
